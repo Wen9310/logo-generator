@@ -242,7 +242,9 @@ function loadSrc(src){
   return new Promise((ok,err)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=err;i.src=src;});
 }
 
-// ── Auto background removal ──
+// ── Auto background removal (two-pass BFS) ──
+// Pass 1: flood fill from all edges → removes exterior background
+// Pass 2: BFS from all transparent pixels → removes enclosed interior BG (inside letters)
 async function removeBg(src){
   const img=await loadSrc(src);
   const c=document.createElement('canvas');
@@ -250,32 +252,47 @@ async function removeBg(src){
   const ctx=c.getContext('2d');ctx.drawImage(img,0,0);
   const imgD=ctx.getImageData(0,0,c.width,c.height);
   const d=imgD.data,W=c.width,H=c.height;
-  function px(x,y){const i=(y*W+x)*4;return[d[i],d[i+1],d[i+2]];}
-  const corners=[px(0,0),px(W-1,0),px(0,H-1),px(W-1,H-1)];
-  const bgR=corners.reduce((s,c)=>s+c[0],0)/4;
-  const bgG=corners.reduce((s,c)=>s+c[1],0)/4;
-  const bgB=corners.reduce((s,c)=>s+c[2],0)/4;
-  const THR=40;
-  function matches(x,y){
-    const i=(y*W+x)*4;
-    if(d[i+3]<10)return true;
-    return Math.sqrt((d[i]-bgR)**2+(d[i+1]-bgG)**2+(d[i+2]-bgB)**2)<THR;
+
+  // Sample BG color from all 4 edges (more reliable than corners only)
+  const smp=[];
+  const step=Math.max(1,Math.floor(Math.min(W,H)/20));
+  for(let x=0;x<W;x+=step){smp.push((0*W+x)*4);smp.push(((H-1)*W+x)*4);}
+  for(let y=1;y<H-1;y+=step){smp.push((y*W+0)*4);smp.push((y*W+W-1)*4);}
+  const bgR=smp.reduce((s,i)=>s+d[i],0)/smp.length;
+  const bgG=smp.reduce((s,i)=>s+d[i+1],0)/smp.length;
+  const bgB=smp.reduce((s,i)=>s+d[i+2],0)/smp.length;
+  const THR=42;
+
+  function isBg(idx){
+    if(d[idx*4+3]<10)return false; // already transparent
+    return Math.sqrt((d[idx*4]-bgR)**2+(d[idx*4+1]-bgG)**2+(d[idx*4+2]-bgB)**2)<THR;
   }
-  const visited=new Uint8Array(W*H);
-  const queue=[];
-  function enq(x,y){
-    if(x<0||x>=W||y<0||y>=H)return;
-    const idx=y*W+x;
-    if(visited[idx])return;if(!matches(x,y))return;
-    visited[idx]=1;queue.push(idx);
+
+  // ── Pass 1: BFS from all edge pixels ──
+  const vis1=new Uint8Array(W*H);
+  const q1=[];
+  function enq1(idx){
+    if(idx<0||idx>=W*H||vis1[idx]||!isBg(idx))return;
+    vis1[idx]=1;q1.push(idx);
   }
-  enq(0,0);enq(W-1,0);enq(0,H-1);enq(W-1,H-1);
-  let head=0;
-  while(head<queue.length){
-    const idx=queue[head++];
+  for(let x=0;x<W;x++){enq1(x);enq1((H-1)*W+x);}
+  for(let y=1;y<H-1;y++){enq1(y*W);enq1(y*W+W-1);}
+  let h1=0;
+  while(h1<q1.length){
+    const idx=q1[h1++];
+    d[idx*4+3]=0;
     const x=idx%W,y=Math.floor(idx/W);
-    d[idx*4+3]=0;enq(x+1,y);enq(x-1,y);enq(x,y+1);enq(x,y-1);
+    if(x>0)enq1(idx-1);if(x<W-1)enq1(idx+1);
+    if(y>0)enq1(idx-W);if(y<H-1)enq1(idx+W);
   }
+
+  // ── Pass 2: Remove all remaining BG-colored pixels (enclosed holes inside letters) ──
+  // After pass 1, any pixel still matching bgColor must be an enclosed hole
+  // (it wasn't reachable from the edges), so remove it directly.
+  for(let idx=0;idx<W*H;idx++){
+    if(isBg(idx))d[idx*4+3]=0;
+  }
+
   ctx.putImageData(imgD,0,0);return c.toDataURL('image/png');
 }
 
@@ -467,7 +484,16 @@ async function goStep2(){
     await Promise.all([waitImg(HC),waitImg(HW)]);
     ovMsg.textContent='載入圖片中...';
     let cSrc=S.colorSrc;
-    if(document.getElementById('bg1').checked){ovMsg.textContent='自動去背中（彩色版）...';cSrc=await removeBg(cSrc);}
+    let cSrcNoBg=null; // BG-removed version used for dark/white conversion
+    if(document.getElementById('bg1').checked){
+      ovMsg.textContent='自動去背中（彩色版）...';
+      cSrc=await removeBg(S.colorSrc);
+      cSrcNoBg=cSrc; // already done
+    }else{
+      // Silently remove BG for white conversion even if toggle is off
+      ovMsg.textContent='處理深色版本中...';
+      cSrcNoBg=await removeBg(S.colorSrc);
+    }
     S.cImg=await loadSrc(cSrc);
     if(S.darkSrc){
       let dSrc=S.darkSrc;
@@ -475,7 +501,8 @@ async function goStep2(){
       S.dImg=await loadSrc(dSrc);
     }else{
       ovMsg.textContent='轉換深色版本中...';
-      S.whiteSrc=await makeWhite(cSrc);S.wImg=await loadSrc(S.whiteSrc);
+      // Use BG-removed version so only colored pixels become white (not white BG)
+      S.whiteSrc=await makeWhite(cSrcNoBg);S.wImg=await loadSrc(S.whiteSrc);
     }
     S.comp={cx:435,cy:225,sc:1};S.hahow={cx:1365,cy:225,sc:1};
     document.getElementById('csr').value=100;document.getElementById('csv').textContent='100%';
